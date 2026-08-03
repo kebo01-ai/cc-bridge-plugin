@@ -3,7 +3,7 @@
   "name": "CC Bridge",
   "description": "Manage Claude Code sessions on worker nodes via tmux + Ray",
   "contracts": {
-    "tools": ["cc_start", "cc_send", "cc_read", "cc_keys", "cc_list", "cc_stop"]
+    "tools": ["cc_start", "cc_send", "cc_read", "cc_keys", "cc_list", "cc_stop", "cc_on", "cc_off", "cc_status"]
   },
   "activation": {
     "onStartup": true
@@ -30,6 +30,10 @@
       "sessionPrefix": {
         "type": "string",
         "description": "Prefix for tmux session names (default: cc-)"
+      },
+      "claudePath": {
+        "type": "string",
+        "description": "Absolute path to claude binary on worker nodes (default: 'claude' from PATH)"
       },
       "defaultCwd": {
         "type": "string",

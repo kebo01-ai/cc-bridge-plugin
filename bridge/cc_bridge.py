@@ -169,7 +169,7 @@ def _send_keys(run, name: str, literal: str = None, key: str = None):
         ray.get(run.remote(f"tmux send-keys -t {name} '{escaped}'"), timeout=15)
 
 
-def cc_start(node_ip: str, cwd: str = "~", name: str = None) -> dict:
+def cc_start(node_ip: str, cwd: str = "~", name: str = None, claude_path: str = None) -> dict:
     run = _run_fn(node_ip)
     if name is None:
         name = f"cc-{int(time.time()) % 100000}"
@@ -184,11 +184,14 @@ def cc_start(node_ip: str, cwd: str = "~", name: str = None) -> dict:
     if cwd != "~" and not cwd.startswith("/"):
         resolve_cwd = f"~/{cwd}"
 
+    # Claude binary: use configured path or default to 'claude' from PATH
+    claude_bin = claude_path or "claude"
+
     # start tmux + cd to cwd + start claude
     # IS_SANDBOX=1 bypasses root+skip-permissions security block in CC 2.1+
     cmd = (
         f"tmux new-session -d -s {name} -c {resolve_cwd} && "
-        f"tmux send-keys -t {name} 'cd {resolve_cwd} && IS_SANDBOX=1 claude --dangerously-skip-permissions' Enter && "
+        f"tmux send-keys -t {name} 'cd {resolve_cwd} && IS_SANDBOX=1 {claude_bin} --dangerously-skip-permissions' Enter && "
         f"echo OK"
     )
     r = ray.get(run.remote(cmd, timeout=20), timeout=25)
@@ -320,10 +323,119 @@ def cc_status(node_ip: str, name: str) -> dict:
     }
 
 
+def _get_job_name_map() -> dict:
+    """Build IP -> {job_name, alias} mapping from loop-ray status + owners.yaml."""
+    import subprocess
+
+    # Load owners.yaml for alias lookup
+    owners_file = "/root/.openclaw/workspace/cauldron/data/owners.yaml"
+    job_id_to_alias = {}
+    ip_to_alias = {}
+    try:
+        import yaml
+        with open(owners_file) as f:
+            owners = yaml.safe_load(f) or {}
+        for jid, meta in (owners.get("by_job_id") or {}).items():
+            exp = meta.get("exp", "")
+            owner = meta.get("owner", "")
+            if exp:
+                job_id_to_alias[jid] = f"{owner}/{exp}" if owner else exp
+        for ip, meta in (owners.get("by_ip") or {}).items():
+            exp = meta.get("exp", "")
+            owner = meta.get("owner", "")
+            if exp:
+                ip_to_alias[ip] = f"{owner}/{exp}" if owner else exp
+    except Exception:
+        pass
+
+    # Parse loop-ray status text output
+    ip_map = {}  # ip -> {"job_name": ..., "alias": ..., "job_id": ...}
+    try:
+        r = subprocess.run(
+            ["/root/paddlejob/workspace/env_run/kebo01/loop/.venv/bin/loop-ray", "status"],
+            capture_output=True, text=True, timeout=15,
+            env={**os.environ, "PATH": "/root/paddlejob/workspace/env_run/kebo01/loop/.venv/bin:" + os.environ.get("PATH", "")}
+        )
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                candidate_ip = parts[-1]
+                if IP_RE.match(candidate_ip):
+                    job_name = parts[0]
+                    # Try to find job_id in the line
+                    job_id = ""
+                    for p in parts:
+                        if p.startswith("job-"):
+                            job_id = p
+                            break
+                    # Resolve alias: by_job_id > by_ip
+                    alias = ""
+                    if job_id and job_id in job_id_to_alias:
+                        alias = job_id_to_alias[job_id]
+                    elif candidate_ip in ip_to_alias:
+                        alias = ip_to_alias[candidate_ip]
+                    ip_map[candidate_ip] = {
+                        "job_name": job_name,
+                        "alias": alias,
+                        "job_id": job_id,
+                    }
+    except Exception:
+        pass
+    return ip_map
+
+
+def _get_session_summary(run, name: str) -> str:
+    """Get a meaningful summary from the session — find the last substantive CC output."""
+    try:
+        pane = _capture(run, name, 80)
+        cleaned = _clean(pane)
+        lines = cleaned.splitlines()
+
+        # Skip lines that are just UI chrome (prompt, borders, status)
+        chrome_markers = (
+            "───", "───", "━━━", "bypass permissions",
+            "new task?", "/clear to save", "shift+tab",
+            "← for agents", "⏵⏵",
+        )
+
+        # Walk backwards to find substantive content
+        substantive = []
+        for line in reversed(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # Skip chrome
+            if any(m in stripped for m in chrome_markers):
+                continue
+            # Skip bare prompt chars
+            if stripped in ("❯", ">", "$"):
+                continue
+            substantive.append(stripped)
+            if len(substantive) >= 3:
+                break
+
+        substantive.reverse()
+        return "\n".join(substantive) if substantive else "(empty session)"
+    except Exception:
+        return ""
+
+
 def cc_list(node_ip: str = None) -> dict:
     """List CC sessions. If node_ip is None, scan all nodes in registry."""
+    # Get job name mapping
+    ip_to_job = _get_job_name_map()
+
     if node_ip:
-        return _list_single_node(node_ip)
+        result = _list_single_node(node_ip)
+        if result.get("ok") and result.get("sessions"):
+            run = _run_fn(node_ip)
+            job_info = ip_to_job.get(node_ip, {})
+            for s in result["sessions"]:
+                s["node_ip"] = node_ip
+                s["job_name"] = job_info.get("job_name", "") if isinstance(job_info, dict) else ""
+                s["alias"] = job_info.get("alias", "") if isinstance(job_info, dict) else ""
+                s["summary"] = _get_session_summary(run, s["name"])
+        return result
 
     # Scan all registered nodes
     registry = _load_registry()
@@ -332,19 +444,30 @@ def cc_list(node_ip: str = None) -> dict:
         return {"ok": True, "sessions": [], "note": "No registered nodes. Specify node_ip or start a session first."}
 
     all_sessions = []
+    failed_nodes = set()  # track nodes we couldn't reach
     for nip in sorted(nodes):
         try:
             result = _list_single_node(nip)
             if result.get("ok") and result.get("sessions"):
+                run = _run_fn(nip)
+                job_info = ip_to_job.get(nip, {})
                 for s in result["sessions"]:
                     s["node_ip"] = nip
+                    s["job_name"] = job_info.get("job_name", "") if isinstance(job_info, dict) else ""
+                    s["alias"] = job_info.get("alias", "") if isinstance(job_info, dict) else ""
+                    s["summary"] = _get_session_summary(run, s["name"])
                 all_sessions.extend(result["sessions"])
         except Exception:
+            failed_nodes.add(nip)
             all_sessions.append({"node_ip": nip, "name": "?", "info": f"failed to reach {nip}"})
-
-    # Reconcile registry: remove sessions no longer alive
+    # Reconcile registry: remove sessions no longer alive.
+    # IMPORTANT: Do NOT remove sessions on nodes we failed to reach —
+    # they may still be alive, we just couldn't verify.
     live_names = {s["name"] for s in all_sessions if s.get("name") != "?"}
-    stale = [k for k in registry if k not in live_names]
+    stale = [
+        k for k, v in registry.items()
+        if k not in live_names and v.get("node_ip") not in failed_nodes
+    ]
     if stale:
         for k in stale:
             del registry[k]
@@ -392,13 +515,14 @@ def main():
     s.add_argument("node_ip")
     s.add_argument("--cwd", default="~")
     s.add_argument("--name", default=None)
+    s.add_argument("--claude-path", default=None, help="Absolute path to claude binary (default: 'claude' from PATH)")
 
     s = sub.add_parser("send")
     s.add_argument("node_ip")
     s.add_argument("session_name")
     s.add_argument("message")
     s.add_argument("--wait", action="store_true", help="poll until CC finishes")
-    s.add_argument("--timeout", type=int, default=120)
+    s.add_argument("--timeout", type=int, default=600)
 
     s = sub.add_parser("read")
     s.add_argument("node_ip")
@@ -425,7 +549,7 @@ def main():
     ray.init("auto", ignore_reinit_error=True)
 
     if args.action == "start":
-        out = cc_start(args.node_ip, cwd=args.cwd, name=args.name)
+        out = cc_start(args.node_ip, cwd=args.cwd, name=args.name, claude_path=args.claude_path)
     elif args.action == "send":
         out = cc_send(args.node_ip, args.session_name, args.message,
                       wait=args.wait, timeout=args.timeout)

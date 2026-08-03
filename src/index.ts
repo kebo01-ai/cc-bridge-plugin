@@ -15,6 +15,9 @@ const JSON_DELIMITER = "__CC_BRIDGE_JSON__";
 /** Per-session mutex: prevents concurrent sends to the same session */
 const sessionLocks = new Map<string, Promise<unknown>>();
 
+/** Active CC session state — only one session can be active at a time */
+let activeSession: { node_ip: string; session_name: string } | null = null;
+
 function lockKey(nodeIp: string, sessionName: string): string {
   return `${nodeIp}:${sessionName}`;
 }
@@ -47,6 +50,11 @@ const ConfigSchema = Type.Object({
     Type.String({
       description: "Prefix for tmux session names (default: 'cc-')",
       default: "cc-",
+    })
+  ),
+  claudePath: Type.Optional(
+    Type.String({
+      description: "Absolute path to claude binary on worker nodes (default: 'claude' from PATH)",
     })
   ),
   defaultCwd: Type.Optional(
@@ -83,7 +91,9 @@ function parseOutput(output: string): unknown {
  * Resolve bridge script path and python path from config.
  */
 function resolvePaths(config: Config): { pythonPath: string; bridgePath: string; cwd: string } {
-  const pluginDir = resolve(import.meta.dirname || __dirname);
+  // import.meta.dirname points to dist/ after compilation; bridge/ lives at project root
+  const distDir = resolve(import.meta.dirname || __dirname);
+  const pluginDir = resolve(distDir, "..");
   const pythonPath = config.pythonPath || "python3";
   const bridgePath = config.bridgePath || resolve(pluginDir, "bridge", "cc_bridge.py");
   const cwd = config.bridgeCwd || pluginDir;
@@ -105,7 +115,7 @@ async function runBridge(args: string[], config: Config, lock?: string): Promise
         [bridgePath, ...args],
         {
           cwd,
-          timeout: 180_000,
+          timeout: 660_000,
           encoding: "utf-8",
           env: {
             ...process.env,
@@ -166,6 +176,7 @@ export default defineToolPlugin({
         if (cwd) args.push("--cwd", cwd);
         else if (config.defaultCwd) args.push("--cwd", config.defaultCwd);
         if (name) args.push("--name", name);
+        if (config.claudePath) args.push("--claude-path", config.claudePath);
         return runBridge(args, config);
       },
     }),
@@ -183,13 +194,13 @@ export default defineToolPlugin({
           Type.Boolean({ description: "Wait for CC to finish responding (default: true)", default: true })
         ),
         timeout: Type.Optional(
-          Type.Number({ description: "Max seconds to wait (default: 120)", default: 120 })
+          Type.Number({ description: "Max seconds to wait (default: 600)", default: 600 })
         ),
       }),
       async execute({ node_ip, session_name, message, wait, timeout }, config) {
         const args = ["send", node_ip, session_name, message];
         if (wait !== false) args.push("--wait");
-        if (timeout && timeout !== 120) args.push("--timeout", String(timeout));
+        if (timeout && timeout !== 600) args.push("--timeout", String(timeout));
         return runBridge(args, config, lockKey(node_ip, session_name));
       },
     }),
@@ -240,7 +251,17 @@ export default defineToolPlugin({
       async execute({ node_ip }, config) {
         const args = ["list"];
         if (node_ip) args.push(node_ip);
-        return runBridge(args, config);
+        const result = (await runBridge(args, config)) as any;
+        // Annotate each session with active status (only one can be active)
+        if (result && result.ok && Array.isArray(result.sessions)) {
+          for (const s of result.sessions) {
+            s.active =
+              activeSession !== null &&
+              activeSession.node_ip === s.node_ip &&
+              activeSession.session_name === s.name;
+          }
+        }
+        return result;
       },
     }),
 
@@ -253,7 +274,80 @@ export default defineToolPlugin({
         session_name: Type.String({ description: "CC session name to stop" }),
       }),
       async execute({ node_ip, session_name }, config) {
+        // If stopping the active session, auto-deactivate
+        if (
+          activeSession &&
+          activeSession.node_ip === node_ip &&
+          activeSession.session_name === session_name
+        ) {
+          activeSession = null;
+        }
         return runBridge(["stop", node_ip, session_name], config);
+      },
+    }),
+
+    tool({
+      name: "cc_on",
+      label: "Activate CC Session",
+      description:
+        "Set a CC session as the active foreground session. Only one session can be active at a time. " +
+        "When active, user messages are forwarded to this CC session automatically. " +
+        "If another session is already active, it will be deactivated first.",
+      parameters: Type.Object({
+        node_ip: Type.String({ description: "Worker node IP" }),
+        session_name: Type.String({ description: "CC session name to activate" }),
+      }),
+      async execute({ node_ip, session_name }, config) {
+        // Verify session exists before activating
+        const args = ["read", node_ip, session_name, "--lines", "5"];
+        const result = (await runBridge(args, config, lockKey(node_ip, session_name))) as any;
+        if (result && result.ok === false) {
+          return { ok: false, error: result.error || `Session not found: ${session_name}` };
+        }
+        const prev = activeSession;
+        activeSession = { node_ip, session_name };
+        return {
+          ok: true,
+          active: { node_ip, session_name },
+          previous: prev,
+          note: "Session activated. User messages will be forwarded to this CC session. Use cc_off to deactivate.",
+        };
+      },
+    }),
+
+    tool({
+      name: "cc_off",
+      label: "Deactivate CC Session",
+      description:
+        "Deactivate the current active CC session. Returns to normal conversation mode. " +
+        "If no session is active, this is a no-op.",
+      parameters: Type.Object({}),
+      async execute(_params, _config) {
+        const prev = activeSession;
+        activeSession = null;
+        if (prev) {
+          return {
+            ok: true,
+            deactivated: prev,
+            note: "CC session deactivated. Back to normal conversation mode.",
+          };
+        }
+        return { ok: true, note: "No active session to deactivate." };
+      },
+    }),
+
+    tool({
+      name: "cc_status",
+      label: "CC Bridge Status",
+      description:
+        "Show the current CC Bridge routing state: which session is active (if any).",
+      parameters: Type.Object({}),
+      async execute(_params, _config) {
+        return {
+          ok: true,
+          active: activeSession,
+          mode: activeSession ? "cc_forward" : "normal",
+        };
       },
     }),
   ],
