@@ -1,11 +1,15 @@
-import { Type } from "@sinclair/typebox";
+import { Type, type Static } from "@sinclair/typebox";
 import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
 import { execFile } from "node:child_process";
 import { resolve } from "node:path";
 
-const LOOP_DIR = "/root/paddlejob/workspace/env_run/kebo01/loop";
-const VENV_PY = resolve(LOOP_DIR, ".venv/bin/python3");
-const BRIDGE_SCRIPT = resolve(LOOP_DIR, ".claude/skills/cc-bridge/cc_bridge.py");
+/**
+ * CC Bridge — OpenClaw Plugin
+ *
+ * Manage Claude Code sessions on worker nodes via tmux + Ray remote.
+ * All paths and settings are configurable via plugin config.
+ */
+
 const JSON_DELIMITER = "__CC_BRIDGE_JSON__";
 
 /** Per-session mutex: prevents concurrent sends to the same session */
@@ -15,12 +19,50 @@ function lockKey(nodeIp: string, sessionName: string): string {
   return `${nodeIp}:${sessionName}`;
 }
 
+/** Configuration schema — all paths configurable, sensible defaults for standalone use */
+const ConfigSchema = Type.Object({
+  pythonPath: Type.Optional(
+    Type.String({
+      description: "Path to Python interpreter with ray installed (default: python3)",
+      default: "python3",
+    })
+  ),
+  bridgePath: Type.Optional(
+    Type.String({
+      description: "Path to cc_bridge.py script (default: ./bridge/cc_bridge.py relative to plugin dir)",
+    })
+  ),
+  bridgeCwd: Type.Optional(
+    Type.String({
+      description: "Working directory for bridge script execution (default: plugin directory)",
+    })
+  ),
+  rayAddress: Type.Optional(
+    Type.String({
+      description: "Ray cluster address (default: 'auto' — connects to local cluster)",
+      default: "auto",
+    })
+  ),
+  sessionPrefix: Type.Optional(
+    Type.String({
+      description: "Prefix for tmux session names (default: 'cc-')",
+      default: "cc-",
+    })
+  ),
+  defaultCwd: Type.Optional(
+    Type.String({
+      description: "Default working directory for new CC sessions on workers",
+    })
+  ),
+});
+
+type Config = Static<typeof ConfigSchema>;
+
 /**
  * Parse JSON output from the bridge script using the deterministic delimiter.
  * Falls back to indexOf("{") if delimiter not found (backward compat).
  */
 function parseOutput(output: string): unknown {
-  // Prefer deterministic delimiter
   const delimIdx = output.indexOf(JSON_DELIMITER);
   if (delimIdx >= 0) {
     const jsonStr = output.slice(delimIdx + JSON_DELIMITER.length).trim();
@@ -28,7 +70,6 @@ function parseOutput(output: string): unknown {
       return JSON.parse(jsonStr);
     } catch {}
   }
-  // Fallback: find first '{'
   const braceIdx = output.indexOf("{");
   if (braceIdx >= 0) {
     try {
@@ -39,34 +80,51 @@ function parseOutput(output: string): unknown {
 }
 
 /**
- * Run the Python bridge script asynchronously via child_process.execFile.
- * No shell is involved — args are passed as an array (injection-safe).
- * Concurrent calls to the same session are serialized via a per-session lock.
+ * Resolve bridge script path and python path from config.
  */
-async function runBridge(args: string[], lock?: string): Promise<unknown> {
+function resolvePaths(config: Config): { pythonPath: string; bridgePath: string; cwd: string } {
+  const pluginDir = resolve(import.meta.dirname || __dirname);
+  const pythonPath = config.pythonPath || "python3";
+  const bridgePath = config.bridgePath || resolve(pluginDir, "bridge", "cc_bridge.py");
+  const cwd = config.bridgeCwd || pluginDir;
+  return { pythonPath, bridgePath, cwd };
+}
+
+/**
+ * Run the Python bridge script asynchronously via child_process.execFile.
+ * No shell involved — args passed as array (injection-safe).
+ * Concurrent calls to the same session are serialized via per-session lock.
+ */
+async function runBridge(args: string[], config: Config, lock?: string): Promise<unknown> {
+  const { pythonPath, bridgePath, cwd } = resolvePaths(config);
+
   const doRun = (): Promise<unknown> =>
-    new Promise((resolve) => {
+    new Promise((res) => {
       execFile(
-        VENV_PY,
-        [BRIDGE_SCRIPT, ...args],
+        pythonPath,
+        [bridgePath, ...args],
         {
-          cwd: LOOP_DIR,
+          cwd,
           timeout: 180_000,
           encoding: "utf-8",
-          env: { ...process.env, RAY_ADDRESS: "auto" },
-          maxBuffer: 4 * 1024 * 1024, // 4MB
+          env: {
+            ...process.env,
+            RAY_ADDRESS: config.rayAddress || "auto",
+            CC_BRIDGE_PREFIX: config.sessionPrefix || "cc-",
+          },
+          maxBuffer: 4 * 1024 * 1024,
         },
         (error, stdout, _stderr) => {
           const output = stdout || (error as any)?.stdout || "";
           const parsed = parseOutput(output);
           if (parsed) {
-            resolve(parsed);
+            res(parsed);
             return;
           }
           if (error) {
-            resolve({ ok: false, error: error.message?.slice(0, 500) || String(error) });
+            res({ ok: false, error: error.message?.slice(0, 500) || String(error) });
           } else {
-            resolve({ ok: false, error: "No JSON output", raw: output.slice(0, 500) });
+            res({ ok: false, error: "No JSON output", raw: output.slice(0, 500) });
           }
         }
       );
@@ -74,11 +132,9 @@ async function runBridge(args: string[], lock?: string): Promise<unknown> {
 
   if (!lock) return doRun();
 
-  // Serialize calls to the same session
   const prev = sessionLocks.get(lock) ?? Promise.resolve();
   const next = prev.then(doRun, doRun);
   sessionLocks.set(lock, next);
-  // Clean up when done to avoid memory leak
   next.finally(() => {
     if (sessionLocks.get(lock) === next) sessionLocks.delete(lock);
   });
@@ -89,11 +145,7 @@ export default defineToolPlugin({
   id: "cc-bridge-plugin",
   name: "CC Bridge",
   description: "Manage Claude Code sessions on worker nodes via tmux + Ray remote.",
-  configSchema: Type.Object({
-    defaultCwd: Type.Optional(
-      Type.String({ description: "Default cwd for new sessions (default: ~)" })
-    ),
-  }),
+  configSchema: ConfigSchema,
   tools: (tool) => [
     tool({
       name: "cc_start",
@@ -106,9 +158,7 @@ export default defineToolPlugin({
           Type.String({ description: "Session name (auto-generated if omitted)" })
         ),
         cwd: Type.Optional(
-          Type.String({
-            description: "Working directory on the worker (default: ~)",
-          })
+          Type.String({ description: "Working directory on the worker (default: ~)" })
         ),
       }),
       async execute({ node_ip, name, cwd }, config) {
@@ -116,7 +166,7 @@ export default defineToolPlugin({
         if (cwd) args.push("--cwd", cwd);
         else if (config.defaultCwd) args.push("--cwd", config.defaultCwd);
         if (name) args.push("--name", name);
-        return runBridge(args);
+        return runBridge(args, config);
       },
     }),
 
@@ -130,23 +180,17 @@ export default defineToolPlugin({
         session_name: Type.String({ description: "CC session name" }),
         message: Type.String({ description: "Message to send to Claude Code" }),
         wait: Type.Optional(
-          Type.Boolean({
-            description: "Wait for CC to finish responding (default: true)",
-            default: true,
-          })
+          Type.Boolean({ description: "Wait for CC to finish responding (default: true)", default: true })
         ),
         timeout: Type.Optional(
-          Type.Number({
-            description: "Max seconds to wait (default: 120)",
-            default: 120,
-          })
+          Type.Number({ description: "Max seconds to wait (default: 120)", default: 120 })
         ),
       }),
-      async execute({ node_ip, session_name, message, wait, timeout }) {
+      async execute({ node_ip, session_name, message, wait, timeout }, config) {
         const args = ["send", node_ip, session_name, message];
         if (wait !== false) args.push("--wait");
         if (timeout && timeout !== 120) args.push("--timeout", String(timeout));
-        return runBridge(args, lockKey(node_ip, session_name));
+        return runBridge(args, config, lockKey(node_ip, session_name));
       },
     }),
 
@@ -162,10 +206,10 @@ export default defineToolPlugin({
           Type.Number({ description: "Lines to capture (default: 80)", default: 80 })
         ),
       }),
-      async execute({ node_ip, session_name, lines }) {
+      async execute({ node_ip, session_name, lines }, config) {
         const args = ["read", node_ip, session_name];
         if (lines && lines !== 80) args.push("--lines", String(lines));
-        return runBridge(args, lockKey(node_ip, session_name));
+        return runBridge(args, config, lockKey(node_ip, session_name));
       },
     }),
 
@@ -177,12 +221,10 @@ export default defineToolPlugin({
       parameters: Type.Object({
         node_ip: Type.String({ description: "Worker node IP" }),
         session_name: Type.String({ description: "CC session name" }),
-        key: Type.String({
-          description: "tmux key token: Enter, Escape, Up, Down, C-c, Y, N, etc.",
-        }),
+        key: Type.String({ description: "tmux key token: Enter, Escape, Up, Down, C-c, Y, N, etc." }),
       }),
-      async execute({ node_ip, session_name, key }) {
-        return runBridge(["keys", node_ip, session_name, key], lockKey(node_ip, session_name));
+      async execute({ node_ip, session_name, key }, config) {
+        return runBridge(["keys", node_ip, session_name, key], config, lockKey(node_ip, session_name));
       },
     }),
 
@@ -195,10 +237,10 @@ export default defineToolPlugin({
           Type.String({ description: "Worker node IP (omit to list all known nodes)" })
         ),
       }),
-      async execute({ node_ip }) {
+      async execute({ node_ip }, config) {
         const args = ["list"];
         if (node_ip) args.push(node_ip);
-        return runBridge(args);
+        return runBridge(args, config);
       },
     }),
 
@@ -210,8 +252,8 @@ export default defineToolPlugin({
         node_ip: Type.String({ description: "Worker node IP" }),
         session_name: Type.String({ description: "CC session name to stop" }),
       }),
-      async execute({ node_ip, session_name }) {
-        return runBridge(["stop", node_ip, session_name]);
+      async execute({ node_ip, session_name }, config) {
+        return runBridge(["stop", node_ip, session_name], config);
       },
     }),
   ],

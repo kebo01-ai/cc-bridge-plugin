@@ -11,6 +11,26 @@
   "configSchema": {
     "type": "object",
     "properties": {
+      "pythonPath": {
+        "type": "string",
+        "description": "Path to Python interpreter with ray installed"
+      },
+      "bridgePath": {
+        "type": "string",
+        "description": "Path to cc_bridge.py (default: ./bridge/cc_bridge.py)"
+      },
+      "bridgeCwd": {
+        "type": "string",
+        "description": "Working directory for bridge execution"
+      },
+      "rayAddress": {
+        "type": "string",
+        "description": "Ray cluster address (default: auto)"
+      },
+      "sessionPrefix": {
+        "type": "string",
+        "description": "Prefix for tmux session names (default: cc-)"
+      },
       "defaultCwd": {
         "type": "string",
         "description": "Default working directory for new CC sessions"

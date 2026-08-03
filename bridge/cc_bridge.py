@@ -21,7 +21,7 @@ import time
 
 import ray
 
-TMUX_PREFIX = "cc-"
+TMUX_PREFIX = os.environ.get("CC_BRIDGE_PREFIX", "cc-")
 # CC busy markers: session is busy when any of these appear in pane output.
 # This list should be updated if CC changes its UI strings.
 BUSY_MARKERS = (
