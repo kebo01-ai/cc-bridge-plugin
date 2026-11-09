@@ -33,8 +33,8 @@ def _connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
-    if not _initialized:
-        with _init_lock:
+    with _init_lock:  # re-check inside the lock, not outside it
+        if not _initialized:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS agents (
@@ -100,8 +100,9 @@ def post(to: str, body: str, sender: str = None) -> dict:
         conn.close()
 
 
-def _fetch(me: str, since_id: int) -> list:
-    conn = _connect()
+def _fetch(me: str, since_id: int, conn: sqlite3.Connection = None) -> list:
+    own = conn is None
+    conn = conn or _connect()
     try:
         rows = conn.execute(
             "SELECT id, sender, body, ts FROM messages WHERE recipient=? AND id>? ORDER BY id",
@@ -114,20 +115,40 @@ def _fetch(me: str, since_id: int) -> list:
         conn.commit()
         return [dict(r) for r in rows]
     finally:
-        conn.close()
+        if own:
+            conn.close()
+
+
+# A long-poll occupies one server worker thread for its whole duration, so an unbounded
+# timeout (an LLM can pass timeout=100000) would let a few calls exhaust the pool and
+# stall the server. Cap it; callers just poll again.
+MAX_WAIT_S = int(os.environ.get("CC_MCP_INBOX_MAX_WAIT", "120"))
 
 
 def inbox(me: str, since_id: int = 0, wait: bool = False, timeout: int = 30) -> dict:
     """Return messages with id > since_id. If wait, long-poll until some arrive or timeout.
 
     Response includes `cursor` = max id seen, to pass back as since_id next call.
+    `timeout` is clamped to CC_MCP_INBOX_MAX_WAIT (default 120s).
     """
     me = _valid_name(me)
     since_id = int(since_id or 0)
-    deadline = time.time() + max(0, int(timeout))
-    while True:
+    timeout = max(0, min(int(timeout or 0), MAX_WAIT_S))
+    if not wait:
         msgs = _fetch(me, since_id)
-        if msgs or not wait or time.time() >= deadline:
-            cursor = msgs[-1]["id"] if msgs else since_id
-            return {"ok": True, "me": me, "messages": msgs, "cursor": cursor}
-        time.sleep(1.0)
+        return {"ok": True, "me": me, "messages": msgs,
+                "cursor": msgs[-1]["id"] if msgs else since_id}
+
+    # Hold ONE connection for the whole poll instead of reopening every second.
+    deadline = time.time() + timeout
+    conn = _connect()
+    try:
+        while True:
+            msgs = _fetch(me, since_id, conn)
+            if msgs or time.time() >= deadline:
+                return {"ok": True, "me": me, "messages": msgs,
+                        "cursor": msgs[-1]["id"] if msgs else since_id,
+                        "waited": round(timeout - max(0.0, deadline - time.time()), 1)}
+            time.sleep(1.0)
+    finally:
+        conn.close()

@@ -13,6 +13,7 @@ Run:
 """
 import argparse
 import contextlib
+import hmac
 import os
 import sys
 
@@ -74,10 +75,11 @@ def build_mcp() -> "MCPServer":
 
 
 class BearerAuth:
-    """Minimal ASGI middleware: require `Authorization: Bearer <token>` on HTTP requests.
+    """ASGI middleware: require `Authorization: Bearer <token>` on every HTTP request.
 
-    No token configured -> open (dev only). OAuth is intentionally not used; this is a
-    single static shared token for an internal cluster.
+    A token is MANDATORY unless the operator passes --insecure. These tools type into a
+    root `claude --dangerously-skip-permissions` session on cluster workers, so an open
+    port here is remote code execution, not just an open dashboard.
     """
 
     def __init__(self, app, token: str | None):
@@ -87,8 +89,13 @@ class BearerAuth:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or not self.token:
             return await self.app(scope, receive, send)
-        headers = dict(scope.get("headers") or [])
-        if headers.get(b"authorization", b"").decode() == f"Bearer {self.token}":
+        raw = dict(scope.get("headers") or []).get(b"authorization", b"")
+        try:
+            presented = raw.decode("latin-1")
+        except Exception:
+            presented = ""
+        # Constant-time: a plain == leaks the token prefix through response timing.
+        if hmac.compare_digest(presented, f"Bearer {self.token}"):
             return await self.app(scope, receive, send)
         await send({"type": "http.response.start", "status": 401,
                     "headers": [(b"content-type", b"text/plain"), (b"www-authenticate", b"Bearer")]})
@@ -100,7 +107,12 @@ def main():
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--token-env", default="CC_MCP_TOKEN",
-                   help="env var holding the bearer token (empty/unset -> no auth, dev only)")
+                   help="env var holding the bearer token (required unless --insecure)")
+    p.add_argument("--insecure", action="store_true",
+                   help="run with NO authentication. These tools drive a root "
+                        "--dangerously-skip-permissions Claude on workers, so this is "
+                        "remote code execution for anyone who can reach the port. "
+                        "Localhost experiments only.")
     p.add_argument("--ray-address", default="auto")
     p.add_argument("--no-ray", action="store_true", help="skip Ray init (mailbox-only / testing)")
     p.add_argument("--allowed-hosts", default=None,
@@ -112,8 +124,18 @@ def main():
     CONFIG["ray_address"] = opt.ray_address
     CONFIG["use_ray"] = not opt.no_ray
     CONFIG["allowed_hosts"] = [h.strip() for h in opt.allowed_hosts.split(",")] if opt.allowed_hosts else None
+
     if not CONFIG["token"]:
-        print(f"[cc-mcp] WARNING: no token in ${opt.token_env} — server is UNAUTHENTICATED", flush=True)
+        if not opt.insecure:
+            p.error(
+                f"no token in ${opt.token_env}. These tools type into a root "
+                f"`claude --dangerously-skip-permissions` session on cluster workers, so an "
+                f"unauthenticated port is remote code execution.\n"
+                f"  Set one:   export {opt.token_env}=$(python3 -c 'import secrets;print(secrets.token_hex(16))')\n"
+                f"  Or accept the risk explicitly with --insecure (localhost only)."
+            )
+        print("[cc-mcp] *** --insecure: NO AUTHENTICATION. Anyone who can reach this port "
+              "can run commands on cluster workers. ***", flush=True)
 
     import uvicorn
 

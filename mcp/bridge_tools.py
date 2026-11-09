@@ -8,7 +8,7 @@ server lifespan before these run.
 """
 import os
 import sys
-import time
+
 
 # bridge/cc_bridge.py is a sibling of this mcp/ dir.
 _BRIDGE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bridge")
@@ -33,24 +33,17 @@ def _guard(fn_name, *args, **kwargs) -> dict:
 
 
 # --- node-name echo (addressing stays by IP; we only annotate results) ---
-# Resolving ip -> job_name parses `loop-ray status` (~seconds), so cache it with a TTL
-# and reuse the bridge's existing _get_job_name_map() rather than duplicating the logic.
-_JOBMAP = {"ts": 0.0, "map": {}}
-_JOBMAP_TTL = 120.0
-
-
+# No cache here: cc_bridge.job_map() reads loop-ray's registry actor in-process and is
+# itself memoized (CC_JOB_MAP_TTL). A second TTL layer only existed to hide the old
+# subprocess-based job_map and would make a stale name outlive the engine's own TTL.
 def _node_label(node_ip: str) -> dict:
     ident = {"node_ip": node_ip}
     if cc_bridge is None or not node_ip:
         return ident
-    now = time.time()
-    if now - _JOBMAP["ts"] > _JOBMAP_TTL:
-        try:
-            _JOBMAP["map"] = cc_bridge._get_job_name_map() or {}
-            _JOBMAP["ts"] = now
-        except Exception:
-            pass
-    info = _JOBMAP["map"].get(node_ip) or {}
+    try:
+        info = (cc_bridge.job_map() or {}).get(node_ip) or {}
+    except Exception:
+        return ident
     if info.get("job_name"):
         ident["job_name"] = info["job_name"]
     if info.get("alias"):
