@@ -420,6 +420,14 @@ def _get_session_summary(run, name: str) -> str:
         return ""
 
 
+def _live_node_ips() -> set:
+    """IPs of Ray nodes currently alive in the cluster (NodeManagerAddress of Alive nodes)."""
+    try:
+        return {n.get("NodeManagerAddress") for n in ray.nodes() if n.get("Alive")}
+    except Exception:
+        return set()
+
+
 def cc_list(node_ip: str = None) -> dict:
     """List CC sessions. If node_ip is None, scan all nodes in registry."""
     # Get job name mapping
@@ -437,15 +445,34 @@ def cc_list(node_ip: str = None) -> dict:
                 s["summary"] = _get_session_summary(run, s["name"])
         return result
 
-    # Scan all registered nodes
+    # Scan all registered nodes — but only those still alive in the Ray cluster.
     registry = _load_registry()
-    nodes = list({v["node_ip"] for v in registry.values()})
+    nodes = sorted({v["node_ip"] for v in registry.values()})
     if not nodes:
         return {"ok": True, "sessions": [], "note": "No registered nodes. Specify node_ip or start a session first."}
 
+    live_ips = _live_node_ips()
+    if not live_ips:
+        # Can't confirm liveness → don't blind-probe (dead nodes make Ray tasks hang).
+        return {
+            "ok": True, "sessions": [],
+            "note": "Could not read live Ray nodes (ray.nodes() empty); skipped full scan to avoid hangs. "
+                    "Pass node_ip to probe a specific node.",
+        }
+
+    # Auto-cleanup: a node absent from the Ray cluster is unreachable by definition
+    # (cc-bridge reaches sessions only via Ray), so its sessions are dead → prune them now.
+    dead_ips = {nip for nip in nodes if nip not in live_ips}
+    pruned = [k for k, v in registry.items() if v.get("node_ip") in dead_ips]
+    for k in pruned:
+        del registry[k]
+    if pruned:
+        _save_registry(registry)
+    nodes = [nip for nip in nodes if nip in live_ips]
+
     all_sessions = []
-    failed_nodes = set()  # track nodes we couldn't reach
-    for nip in sorted(nodes):
+    failed_nodes = set()  # live nodes we still couldn't probe (transient) — keep their sessions
+    for nip in nodes:
         try:
             result = _list_single_node(nip)
             if result.get("ok") and result.get("sessions"):
@@ -460,20 +487,24 @@ def cc_list(node_ip: str = None) -> dict:
         except Exception:
             failed_nodes.add(nip)
             all_sessions.append({"node_ip": nip, "name": "?", "info": f"failed to reach {nip}"})
-    # Reconcile registry: remove sessions no longer alive.
-    # IMPORTANT: Do NOT remove sessions on nodes we failed to reach —
-    # they may still be alive, we just couldn't verify.
+
+    # Reconcile sessions on live nodes we successfully probed; keep those on
+    # transiently-unreachable live nodes.
     live_names = {s["name"] for s in all_sessions if s.get("name") != "?"}
     stale = [
         k for k, v in registry.items()
-        if k not in live_names and v.get("node_ip") not in failed_nodes
+        if v.get("node_ip") in live_ips and v.get("node_ip") not in failed_nodes and k not in live_names
     ]
     if stale:
         for k in stale:
             del registry[k]
         _save_registry(registry)
 
-    return {"ok": True, "sessions": all_sessions}
+    out = {"ok": True, "sessions": all_sessions}
+    if pruned:
+        out["pruned_dead_nodes"] = sorted(dead_ips)
+        out["pruned_sessions"] = sorted(pruned)
+    return out
 
 
 def _list_single_node(node_ip: str) -> dict:

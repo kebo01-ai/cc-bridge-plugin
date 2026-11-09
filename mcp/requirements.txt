@@ -1,0 +1,4 @@
+# cc-mcp 运行依赖（在 Head 的运行 venv 里安装）
+mcp>=2.3          # 官方 MCP SDK 2.x（FastMCP 已更名 MCPServer）；装最新，走 PyPI
+# ray 由 ../bridge/cc_bridge.py 要求（见 ../bridge/requirements.txt），桥组工具需要它
+uvicorn>=0.34     # ASGI server（streamable-http）
