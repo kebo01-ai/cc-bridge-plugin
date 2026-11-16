@@ -44,6 +44,162 @@ READY_MARKERS = (
     "What can I help",
     ">",  # prompt char (generic fallback)
 )
+# Codex (OpenAI CLI) equivalents. These scraped markers are best-effort and only back the
+# CLI/MCP path (cc_send --wait, cc_status/cc_list); the workbench board reads the authoritative
+# @cc_state tmux option written by Codex hooks. Tune freely if Codex changes its TUI strings.
+CODEX_BUSY_MARKERS = (
+    "Esc to interrupt",
+    "esc to interrupt",
+    "Working",
+    "Thinking",
+    "Esc to cancel",
+)
+# Tightened 2026-11-16 from real captured panes (codex v0.169.0). The ONLY reliable "the
+# interactive prompt is live" signals are the input box and the ready-screen hint bar — both
+# absent while a popup/onboarding screen is up. The old generic ">" / "Codex" matched the
+# startup banner (">_ OpenAI Codex") and almost any pane, so they falsely reported ready while
+# a popup was still on screen; removed.
+CODEX_READY_MARKERS = (
+    "Ask Codex to do anything",   # the live input box
+    "? for shortcuts",            # ready-screen hint bar
+)
+# Popup/onboarding screens that must NOT be read as ready. Captured 2026-11-16 from a fresh
+# CODEX_HOME first-run (a sign-in MENU). With tools/config_codex.sh applied, codex goes
+# straight to the prompt in an untrusted dir (no trust popup) — verified live two ways — so in
+# production these mainly guard the unconfigured/first-run case. A sign-in menu must NOT be
+# blind-passed (Enter would start ChatGPT device auth), so codex carries no auto-pass key
+# (see AGENT_KINDS 'prompt_key'): a popup leaves start 'unconfirmed' with the pane surfaced,
+# never mistaken for ready.
+CODEX_PROMPT_MARKERS = (
+    "Welcome to Codex",
+    "Choose how you want to use Codex",
+    "Press enter to continue",
+    "Sign in with ChatGPT",
+)
+# Claude's first-boot "trust this folder" confirmation — a yes/no, safe to auto-pass with Enter.
+CLAUDE_PROMPT_MARKERS = (
+    "trust this folder",
+    "Yes, I trust",
+)
+
+# Per-agent launch + detection spec. `kind` selects which binary/flags to start and which
+# marker sets to scrape. Binaries are env-overridable so a node can point at a non-PATH
+# install or dodge the Noah /usr/bin/codex conflict (CC_CODEX_BIN=/usr/bin/codex-cli).
+AGENT_KINDS = {
+    "claude": {
+        "bin": os.environ.get("CC_CLAUDE_BIN", "claude"),
+        "args": ["--dangerously-skip-permissions"],
+        "env": "IS_SANDBOX=1 ",   # bypasses root+skip-permissions block in CC 2.1+
+        "proc": "claude",
+        "busy": BUSY_MARKERS,
+        "ready": READY_MARKERS,
+        "prompts": CLAUDE_PROMPT_MARKERS,
+        "prompt_key": "Enter",    # trust-folder is a yes/no → Enter passes it
+    },
+    "codex": {
+        "bin": os.environ.get("CC_CODEX_BIN", "codex"),
+        # -a never -s danger-full-access = yolo mode; --dangerously-bypass-hook-trust lets our
+        # @cc_state hooks run unattended (same risk posture as danger-full-access).
+        # --no-alt-screen = inline TUI (no alternate screen) so the board's scrollback/history
+        # is preserved and scrollable, matching claude.
+        "args": ["-a", "never", "-s", "danger-full-access",
+                 "--dangerously-bypass-hook-trust", "--no-alt-screen"],
+        "env": "",
+        "proc": "codex",
+        "busy": CODEX_BUSY_MARKERS,
+        "ready": CODEX_READY_MARKERS,
+        "prompts": CODEX_PROMPT_MARKERS,
+        "prompt_key": None,       # sign-in menu → do NOT blind-Enter; surface it instead
+        # OPENAI_API_KEY is resolved at launch from loop's config/envs (the owner-managed source
+        # of truth, same precedence config_codex.sh uses) and injected into the start command,
+        # so codex has the key regardless of shell dotfiles. The value never lands in this
+        # source/logs. See _resolve_env_prefix.
+        "inject_env": "OPENAI_API_KEY",
+        "key_vars": ("CODEX_API_KEY", "ANTHROPIC_API_KEY"),
+    },
+}
+DEFAULT_KIND = "claude"
+
+
+def _kind_spec(kind: str) -> dict:
+    """Resolve an agent-kind spec; unknown kinds fall back to the default (claude)."""
+    return AGENT_KINDS.get(kind or DEFAULT_KIND, AGENT_KINDS[DEFAULT_KIND])
+
+
+def _registered_kind(name: str) -> str:
+    """Agent kind recorded for a session; legacy/unregistered sessions default to claude."""
+    return (_load_registry().get(name) or {}).get("kind") or DEFAULT_KIND
+
+
+def _boot_state(pane: str, kind: str) -> str:
+    """Classify a booting pane for `kind`, pure (unit-testable):
+      'prompt'  — a popup/onboarding screen is up; NEVER treat as ready (checked first, so a
+                  banner that also contains a ready marker can't sneak through during a popup).
+      'ready'   — the interactive prompt is live.
+      'waiting' — neither yet; keep polling.
+    """
+    spec = _kind_spec(kind)
+    if any(m in pane for m in spec.get("prompts", ())):
+        return "prompt"
+    if any(m in pane for m in spec["ready"]):
+        return "ready"
+    return "waiting"
+
+
+def _config_envs_path() -> str:
+    """Path to loop's `config/envs` (the owner-managed key source). `CC_ENVS_FILE` overrides;
+    default is derived from this file's real location (loop/3rdparty/cc-bridge-plugin/bridge →
+    loop/config/envs), so a symlinked deploy still points back at the real repo."""
+    return os.environ.get("CC_ENVS_FILE") or os.path.normpath(
+        os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "..", "config", "envs"))
+
+
+def _read_envs_var(path: str, names: tuple) -> str:
+    """Return the first of `names` set in a shell env file (`export NAME=val` / `NAME=val`),
+    honoring later overrides (last assignment wins, like sourcing). Quotes stripped. Does NOT
+    execute the file. '' if the file is unreadable or none of the names are set non-empty."""
+    try:
+        txt = open(path).read()
+    except OSError:
+        return ""
+    for name in names:
+        found = None
+        for line in txt.splitlines():
+            m = re.match(rf"^\s*(?:export\s+)?{re.escape(name)}\s*=\s*(.*)$", line)
+            if m:
+                found = m.group(1).strip()
+        if found:
+            if (found[:1] == '"' and found[-1:] == '"') or (found[:1] == "'" and found[-1:] == "'"):
+                found = found[1:-1]
+            if found:
+                return found
+    return ""
+
+
+def _resolve_env_prefix(kind: str) -> str:
+    """Env-var prefix prepended to a kind's launch command.
+
+    Claude → the static `env` (IS_SANDBOX=1). Codex → the static `env` plus its API key injected
+    as `OPENAI_API_KEY=…`, so codex has the key regardless of shell dotfiles (the tmux pane may
+    not source ~/.bashrc). The key is resolved from `CC_CODEX_API_KEY` (direct, for callers that
+    inject it) else loop's `config/envs` (CODEX_API_KEY, then ANTHROPIC_API_KEY — same precedence
+    as config_codex.sh). The VALUE never appears in this source, logs, or comments — only its
+    env-var name and the config/envs path. No key found → a HARD error naming config/envs and the
+    vars, so we never start a session doomed to 401. Raises ValueError on that failure."""
+    spec = _kind_spec(kind)
+    base = spec.get("env", "")
+    inject = spec.get("inject_env")
+    if not inject:
+        return base
+    envs = _config_envs_path()
+    val = os.environ.get("CC_CODEX_API_KEY") or _read_envs_var(envs, spec.get("key_vars", ()))
+    if not val:
+        raise ValueError(
+            f"{kind}: no API key for {inject} — set one of "
+            f"{', '.join(spec.get('key_vars', ()))} in {envs} (or export CC_CODEX_API_KEY)")
+    return f"{base}{inject}={shlex.quote(val)} "
+
+
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][AB012]")
 # Deterministic JSON output delimiter — printed before JSON so parser doesn't
 # need to hunt for '{' in arbitrary Ray/python output.
@@ -132,7 +288,7 @@ def _registry_txn():
                 fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
-def _register_session(name: str, node_ip: str, cwd: str, role: str = ""):
+def _register_session(name: str, node_ip: str, cwd: str, role: str = "", kind: str = DEFAULT_KIND):
     """Register a session in the registry."""
     with _registry_txn():
         registry = _load_registry()
@@ -140,6 +296,7 @@ def _register_session(name: str, node_ip: str, cwd: str, role: str = ""):
             "node_ip": node_ip,
             "cwd": cwd,
             "role": role,
+            "kind": kind,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         _save_registry(registry)
@@ -228,8 +385,8 @@ def _capture(run, name: str, lines: int = 120) -> str:
     return r["stdout"]
 
 
-def _is_busy(pane: str) -> bool:
-    return any(m in pane for m in BUSY_MARKERS)
+def _is_busy(pane: str, kind: str = DEFAULT_KIND) -> bool:
+    return any(m in pane for m in _kind_spec(kind)["busy"])
 
 
 # tmux key names only (Enter, Escape, C-c, M-x, PageUp, F1, BSpace…). `key` is
@@ -289,14 +446,43 @@ def _send_keys(run, name: str, literal: str = None, key: str = None):
     _send_keys_unlocked(run, name, literal=literal, key=key)
 
 
-def cc_start(node_ip: str, name: str = None, cwd: str = "~", role: str = "",
-             claude_path: str = None) -> dict:
-    """Start a CC session in a fresh tmux on `node_ip`.
+def _launch_cmd(kind: str, name: str, q_cwd: str, bin_override: str = None,
+                env_prefix: str = None) -> str:
+    """Build the remote shell command that starts an agent of `kind` in a fresh tmux.
 
-    Positional order is (node_ip, name, cwd, role) — ccops.py calls it positionally
-    that way; do not reorder without fixing that caller.
+    Pure string construction (no Ray) so launch logic is unit-testable. `name` is already
+    validated (SESSION_NAME_RE) and `q_cwd` already quoted by the caller. Sets a session-scoped
+    `@cc_kind` tmux option right after new-session so the roster/board and the kind-aware
+    hooks can tell claude from codex. `bin_override` (claude's legacy claude_path) wins over the
+    configured binary. `env_prefix` overrides the kind's static env (cc_start passes the
+    secret-resolved prefix here for codex); default keeps the static `env`, so the claude
+    command stays byte-identical and this function never has to read secrets.
+    """
+    spec = _kind_spec(kind)
+    kind_key = kind if kind in AGENT_KINDS else DEFAULT_KIND
+    agent_bin = bin_override or spec["bin"]
+    agent_args = " ".join(shlex.quote(a) for a in spec["args"])
+    env = spec["env"] if env_prefix is None else env_prefix
+    # cwd/bin come from a caller (LLM/MCP/workbench) and land in a remote shell → quote them.
+    inner = f"cd {q_cwd} && {env}{shlex.quote(agent_bin)} {agent_args}"
+    return (
+        f"tmux new-session -d -s {name} -c {q_cwd} && "
+        f"tmux set -t {name} @cc_kind {shlex.quote(kind_key)} && "
+        f"tmux send-keys -t {name} {shlex.quote(inner)} Enter && "
+        f"echo OK"
+    )
+
+
+def cc_start(node_ip: str, name: str = None, cwd: str = "~", role: str = "",
+             claude_path: str = None, kind: str = DEFAULT_KIND) -> dict:
+    """Start an agent session in a fresh tmux on `node_ip`.
+
+    `kind` selects the agent (claude | codex); unknown kinds fall back to claude. Positional
+    order is (node_ip, name, cwd, role) — ccops.py calls it positionally that way; do not
+    reorder without fixing that caller. `claude_path` is kept as a legacy binary override.
     """
     run = _run_fn(node_ip)
+    kind = kind if kind in AGENT_KINDS else DEFAULT_KIND
     if name is None:
         name = f"cc-{int(time.time()) % 100000}"
     else:
@@ -311,41 +497,43 @@ def cc_start(node_ip: str, name: str = None, cwd: str = "~", role: str = "",
         if resolve_cwd != "~" and not resolve_cwd.startswith("/") and not resolve_cwd.startswith("~/"):
             resolve_cwd = f"~/{resolve_cwd}"
 
-        # Claude binary: use configured path or default to 'claude' from PATH
-        claude_bin = claude_path or "claude"
+        # Resolve the env prefix BEFORE touching tmux: for codex this reads the API key and
+        # fails loudly if its secret file is missing, so we never start a 401-doomed session.
+        try:
+            env_prefix = _resolve_env_prefix(kind)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "name": name}
 
-        # start tmux + cd to cwd + start claude. cwd/claude_path come from a caller
-        # (LLM/MCP/workbench) and land in a remote shell → quote them, never interpolate raw.
-        # IS_SANDBOX=1 bypasses root+skip-permissions security block in CC 2.1+
         q_cwd = quote_path(resolve_cwd)
-        inner = f"cd {q_cwd} && IS_SANDBOX=1 {shlex.quote(claude_bin)} --dangerously-skip-permissions"
-        cmd = (
-            f"tmux new-session -d -s {name} -c {q_cwd} && "
-            f"tmux send-keys -t {name} {shlex.quote(inner)} Enter && "
-            f"echo OK"
-        )
+        cmd = _launch_cmd(kind, name, q_cwd, bin_override=claude_path, env_prefix=env_prefix)
         r = ray.get(run.remote(cmd, timeout=20), timeout=25)
         if "OK" not in r["stdout"]:
             return {"ok": False, "error": r["stderr"] or r["stdout"], "name": name}
 
-        # Wait for CC to boot; auto-pass "trust this folder" prompt if it appears
+        # Wait for the agent to boot. A popup/onboarding screen is NEVER ready: if this kind has
+        # a safe auto-pass key (claude's trust-folder → Enter) we send it; otherwise (codex's
+        # sign-in menu) we leave it for a human/agent rather than blind-navigating a menu.
+        prompt_key = _kind_spec(kind).get("prompt_key")
         for _ in range(20):
             time.sleep(1)
             pane = _capture(run, name, 40)
-            if "trust this folder" in pane or "Yes, I trust" in pane:
-                _send_keys_unlocked(run, name, key="Enter")
-                time.sleep(2)
-                continue
-            # CC ready when the interactive prompt box is present
-            if any(m in pane for m in READY_MARKERS):
-                _register_session(name, node_ip, cwd, role)
+            st = _boot_state(pane, kind)
+            if st == "prompt":
+                if prompt_key:
+                    _send_keys_unlocked(run, name, key=prompt_key)
+                    time.sleep(2)
+                continue  # popup on screen → not ready (passed or surfaced), keep waiting
+            if st == "ready":
+                _register_session(name, node_ip, cwd, role, kind)
                 return {"ok": True, "name": name, "node": node_ip, "node_ip": node_ip,
-                        "cwd": cwd, "role": role, "state": "ready"}
+                        "cwd": cwd, "role": role, "kind": kind, "state": "ready"}
 
-        # started but readiness unconfirmed — still register
-        _register_session(name, node_ip, cwd, role)
+        # started but readiness unconfirmed (still booting, or a popup we won't auto-pass) —
+        # register anyway and surface the current pane so the caller can see what it's stuck on.
+        _register_session(name, node_ip, cwd, role, kind)
         return {"ok": True, "name": name, "node": node_ip, "node_ip": node_ip,
-                "cwd": cwd, "role": role, "state": "started_unconfirmed"}
+                "cwd": cwd, "role": role, "kind": kind, "state": "started_unconfirmed",
+                "pane": _clean(_capture(run, name, 40))}
 
 
 def cc_send(node_ip: str, name: str, message: str, wait: bool = False,
@@ -354,6 +542,7 @@ def cc_send(node_ip: str, name: str, message: str, wait: bool = False,
     name = _norm_name(name)
     if not _has_session(run, name):
         return {"ok": False, "error": f"Session '{name}' not found"}
+    kind = _registered_kind(name)
 
     # Serialize the keystroke delivery per pane: two concurrent sends would otherwise
     # interleave characters into the same prompt. Only the typing is held — the
@@ -376,7 +565,7 @@ def cc_send(node_ip: str, name: str, message: str, wait: bool = False,
     time.sleep(2)  # let CC register the input first
     while time.time() < deadline:
         pane = _capture(run, name, 200)
-        if _is_busy(pane):
+        if _is_busy(pane, kind):
             idle_streak = 0
         else:
             idle_streak += 1
@@ -405,7 +594,8 @@ def cc_read(node_ip: str, name: str, lines: int = 80) -> dict:
     if not _has_session(run, name):
         return {"ok": False, "error": f"Session '{name}' not found"}
     pane = _capture(run, name, lines)
-    return {"ok": True, "name": name, "busy": _is_busy(pane), "output": _clean(pane)}
+    kind = _registered_kind(name)
+    return {"ok": True, "name": name, "kind": kind, "busy": _is_busy(pane, kind), "output": _clean(pane)}
 
 
 def cc_keys(node_ip: str, name: str, key: str) -> dict:
@@ -425,26 +615,29 @@ def cc_status(node_ip: str, name: str) -> dict:
     run = _run_fn(node_ip)
     name = _norm_name(name)
 
+    kind = _registered_kind(name)
+    proc = _kind_spec(kind)["proc"]
+
     # 1. tmux session exists?
     if not _has_session(run, name):
-        return {"ok": True, "name": name, "tmux": False, "claude": False, "state": "dead"}
+        return {"ok": True, "name": name, "kind": kind, "tmux": False, "claude": False, "state": "dead"}
 
-    # 2. claude process alive inside that tmux?
+    # 2. agent process alive inside that tmux? (proc name depends on kind: claude / codex)
     r = ray.get(
         run.remote(
             f"tmux list-panes -t {name} -F '#{{pane_pid}}' | head -1 | "
-            f"xargs -I{{}} sh -c 'pgrep -P {{}} -a 2>/dev/null | grep -q claude && echo ALIVE || echo GONE'"
+            f"xargs -I{{}} sh -c 'pgrep -P {{}} -a 2>/dev/null | grep -q {shlex.quote(proc)} && echo ALIVE || echo GONE'"
         ),
         timeout=15,
     )
-    claude_alive = "ALIVE" in r["stdout"]
+    proc_alive = "ALIVE" in r["stdout"]
 
     # 3. Capture pane for busy state
     pane = _capture(run, name, 40)
-    busy = _is_busy(pane)
+    busy = _is_busy(pane, kind)
 
-    if not claude_alive:
-        state = "tmux_only"  # tmux alive but claude exited/crashed
+    if not proc_alive:
+        state = "tmux_only"  # tmux alive but the agent process exited/crashed
     elif busy:
         state = "busy"
     else:
@@ -453,8 +646,9 @@ def cc_status(node_ip: str, name: str) -> dict:
     return {
         "ok": True,
         "name": name,
+        "kind": kind,
         "tmux": True,
-        "claude": claude_alive,
+        "claude": proc_alive,  # kept key for back-compat; means "agent process alive"
         "state": state,
         "busy": busy,
     }
@@ -695,12 +889,14 @@ def cc_list(node_ip: str = None, with_summary: bool = True, force: bool = False)
                 pane = _capture_ip(ip, name, 40)
             except Exception:
                 pass
+            kind = (reg.get(name) or {}).get("kind") or DEFAULT_KIND
             entry = {
                 "name": name, "node_ip": ip,
                 "job_name": facts.get("job_name", ""), "alias": facts.get("alias", ""),
                 "role": (reg.get(name) or {}).get("role", ""),
                 "cwd": (reg.get(name) or {}).get("cwd", ""),
-                "state": "busy" if _is_busy(pane) else "idle",
+                "kind": kind,
+                "state": "busy" if _is_busy(pane, kind) else "idle",
             }
             if with_summary:
                 entry["summary"] = _summarize(ip, name)
@@ -816,6 +1012,7 @@ def main():
     s.add_argument("node_ip")
     s.add_argument("--cwd", default="~")
     s.add_argument("--name", default=None)
+    s.add_argument("--kind", default=DEFAULT_KIND, choices=sorted(AGENT_KINDS), help="agent to launch (default: claude)")
     s.add_argument("--claude-path", default=None, help="Absolute path to claude binary (default: 'claude' from PATH)")
 
     s = sub.add_parser("send")
@@ -850,7 +1047,8 @@ def main():
     ray.init("auto", ignore_reinit_error=True)
 
     if args.action == "start":
-        out = cc_start(args.node_ip, cwd=args.cwd, name=args.name, claude_path=args.claude_path)
+        out = cc_start(args.node_ip, cwd=args.cwd, name=args.name,
+                       claude_path=args.claude_path, kind=args.kind)
     elif args.action == "send":
         out = cc_send(args.node_ip, args.session_name, args.message,
                       wait=args.wait, timeout=args.timeout)
