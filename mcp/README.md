@@ -22,9 +22,12 @@
 | `cc_register(name)` | 建/认领收件箱(幂等) |
 | `cc_post(to, body, sender?)` | 投递消息 |
 | `cc_inbox(me, since_id=0, wait=false, timeout=30)` | 取 id>since_id 的新消息;`wait` 服务端 long-poll。回包带 `cursor`,下次当 since_id |
+| `cc_peek(me, since_id=0, wait=false, timeout=30)` | 相同的游标/等待语义，但不标记已读；供通知 hook 使用 |
 
 > **语义红线**:信箱**叫不醒**空闲的 Claude——接收方必须自己处于活跃循环、主动 `cc_inbox` 才收得到。
 > 要唤醒没在循环里的会话,用桥组 `cc_send` 往它 TTY 注入。两条通道互补。
+> 客户端也可自行配置原生唤醒入口，例如支持 `asyncRewake` 的 Claude Code 后台 hook。
+> 这是客户端能力，mailbox 本身仍然只响应请求。通知送达不等于任务完成。
 
 ## 起服务(Head)
 
@@ -34,7 +37,7 @@ CC_MCP_TOKEN=<随机串> \
   --host 0.0.0.0 --port 8765
 ```
 
-参数:`--token-env`(默认 `CC_MCP_TOKEN`,空则无鉴权、仅本地调试)、`--ray-address`(默认 `auto`)、
+参数:`--token-env`(默认 `CC_MCP_TOKEN`,缺失默认拒绝启动；调试需显式 `--insecure`)、`--ray-address`(默认 `auto`)、
 `--no-ray`(只跑信箱、跳过 Ray,用于测试)。
 
 ## 客户端配置(远端 Claude 的 `.mcp.json`)

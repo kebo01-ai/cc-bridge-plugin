@@ -21,8 +21,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-import bridge_tools  # noqa: E402
 import mailbox  # noqa: E402
+
+import bridge_tools  # noqa: E402
 from mcp.server.mcpserver import MCPServer  # noqa: E402  (mcp 2.x; FastMCP was renamed MCPServer)
 from mcp.server.transport_security import TransportSecuritySettings  # noqa: E402
 
@@ -71,6 +72,9 @@ def build_mcp() -> "MCPServer":
     mcp.add_tool(mailbox.inbox, name="cc_inbox",
                  description="Fetch messages with id > since_id for `me`; wait=true long-polls until "
                              "some arrive or timeout. Pass the returned `cursor` as next since_id.")
+    mcp.add_tool(mailbox.peek, name="cc_peek",
+                 description="Observe mailbox messages without marking them read; same cursor and "
+                             "long-poll semantics as cc_inbox. Used by lifecycle notification hooks.")
     return mcp
 
 

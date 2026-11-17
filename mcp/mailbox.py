@@ -100,7 +100,7 @@ def post(to: str, body: str, sender: str = None) -> dict:
         conn.close()
 
 
-def _fetch(me: str, since_id: int, conn: sqlite3.Connection = None) -> list:
+def _fetch(me: str, since_id: int, conn: sqlite3.Connection = None, mark_read: bool = True) -> list:
     own = conn is None
     conn = conn or _connect()
     try:
@@ -108,7 +108,7 @@ def _fetch(me: str, since_id: int, conn: sqlite3.Connection = None) -> list:
             "SELECT id, sender, body, ts FROM messages WHERE recipient=? AND id>? ORDER BY id",
             (me, since_id),
         ).fetchall()
-        if rows:
+        if rows and mark_read:
             ids = [r["id"] for r in rows]
             conn.executemany("UPDATE messages SET read=1 WHERE id=?", [(i,) for i in ids])
         conn.execute("UPDATE agents SET last_seen=? WHERE name=?", (_now(), me))
@@ -131,24 +131,37 @@ def inbox(me: str, since_id: int = 0, wait: bool = False, timeout: int = 30) -> 
     Response includes `cursor` = max id seen, to pass back as since_id next call.
     `timeout` is clamped to CC_MCP_INBOX_MAX_WAIT (default 120s).
     """
+    return _poll(me, since_id, wait, timeout, mark_read=True)
+
+
+def peek(me: str, since_id: int = 0, wait: bool = False, timeout: int = 30) -> dict:
+    """Observe new messages without marking them read (for hook notifications).
+
+    Uses the same ID cursor/long-poll semantics as inbox. Notification delivery does
+    not acknowledge processing; recipients can still fetch messages with cc_inbox.
+    """
+    return _poll(me, since_id, wait, timeout, mark_read=False)
+
+
+def _poll(me: str, since_id: int, wait: bool, timeout: int, mark_read: bool) -> dict:
     me = _valid_name(me)
     since_id = int(since_id or 0)
     timeout = max(0, min(int(timeout or 0), MAX_WAIT_S))
     if not wait:
-        msgs = _fetch(me, since_id)
+        msgs = _fetch(me, since_id, mark_read=mark_read)
         return {"ok": True, "me": me, "messages": msgs,
                 "cursor": msgs[-1]["id"] if msgs else since_id}
 
     # Hold ONE connection for the whole poll instead of reopening every second.
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     conn = _connect()
     try:
         while True:
-            msgs = _fetch(me, since_id, conn)
-            if msgs or time.time() >= deadline:
+            msgs = _fetch(me, since_id, conn, mark_read=mark_read)
+            if msgs or time.monotonic() >= deadline:
                 return {"ok": True, "me": me, "messages": msgs,
                         "cursor": msgs[-1]["id"] if msgs else since_id,
-                        "waited": round(timeout - max(0.0, deadline - time.time()), 1)}
-            time.sleep(1.0)
+                        "waited": round(timeout - max(0.0, deadline - time.monotonic()), 1)}
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
     finally:
         conn.close()
