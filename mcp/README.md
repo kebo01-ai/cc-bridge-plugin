@@ -23,11 +23,24 @@
 | `cc_post(to, body, sender?)` | 投递消息 |
 | `cc_inbox(me, since_id=0, wait=false, timeout=30)` | 取 id>since_id 的新消息;`wait` 服务端 long-poll。回包带 `cursor`,下次当 since_id |
 | `cc_peek(me, since_id=0, wait=false, timeout=30)` | 相同的游标/等待语义，但不标记已读；供通知 hook 使用 |
+| `cc_directory(query?, active_only?)` | 按 session/node 查稳定地址、旧地址 alias 和接收实例租约 |
+| `cc_heartbeat(name, instance_id, ...)` | watcher 专用；独立续租，旧实例不能冒充新实例在线 |
+| `cc_receipt(me, ids, stage)` | handed_off / acknowledged / completed；不制造新消息、不唤醒对端 |
+| `cc_delivery_status(me?, message_id?)` | 查看投递阶段、时间线和延迟，不消费消息或返回正文 |
 
-> **语义红线**:信箱**叫不醒**空闲的 Claude——接收方必须自己处于活跃循环、主动 `cc_inbox` 才收得到。
-> 要唤醒没在循环里的会话,用桥组 `cc_send` 往它 TTY 注入。两条通道互补。
-> 客户端也可自行配置原生唤醒入口，例如支持 `asyncRewake` 的 Claude Code 后台 hook。
-> 这是客户端能力，mailbox 本身仍然只响应请求。通知送达不等于任务完成。
+客户端通过原生 hook 唤醒：Claude asyncRewake / Codex 原生 queue，由 watcher 等待消息，
+不需要模型不断调用 inbox 或向 TTY 注入。中心存储本身不运行模型；handoff 不表示任务完成。
+
+`cc_register` 可带 node/session/instance_id/aliases；旧地址和完整历史保留，session 短名重名时拒绝寻址。
+`cc_post` 可带 topic_id、reply_to、kind=request/update/result/ack、requires_reply、wake、idempotency_key。
+ack 默认不唤醒、不要求回复；回执优先用 cc_receipt。重试复用相同 idempotency_key，不能换正文。
+自动接收用 `cc_peek(pending_only=true, auto_only=true, instance_id=...)`；手动 inbox 按游标读历史。
+pending 是待自动交付数，unread 仅保留旧 read 标记语义，不能用它推断模型是否已收到。
+
+SQLite 原表做增量迁移，保留 ID、正文和 read。单条上限 256 KiB，批次最多 200 条/通常 64 KiB。
+同进程投递通知条件变量，跨进程写入兜底扫描最长 5 秒；空 peek 不再每秒写在线时间。
+数据库旁 mailbox-events.jsonl 为 5 MiB × 4 份轮转，记录元数据，不记录正文/凭据。
+HTTP access log 默认关闭，调试时可传 `--access-log`；异常日志仍保留。
 
 ## 起服务(Head)
 

@@ -14,6 +14,7 @@ Run:
 import argparse
 import contextlib
 import hmac
+import logging
 import os
 import sys
 
@@ -68,13 +69,26 @@ def build_mcp() -> "MCPServer":
     mcp.add_tool(mailbox.register, name="cc_register",
                  description="Create/claim a mailbox inbox under `name` (idempotent).")
     mcp.add_tool(mailbox.post, name="cc_post",
-                 description="Post a message to recipient `to`'s inbox.")
+                 description="Post to a resolved mailbox. Use topic_id/reply_to for discussion threads, "
+                             "kind=request/update/result/ack and requires_reply for intent. Ack defaults "
+                             "to no wake/no reply. Reuse idempotency_key on transport retries. "
+                             "Use cc_directory to resolve a session name before first contact.")
     mcp.add_tool(mailbox.inbox, name="cc_inbox",
                  description="Fetch messages with id > since_id for `me`; wait=true long-polls until "
                              "some arrive or timeout. Pass the returned `cursor` as next since_id.")
     mcp.add_tool(mailbox.peek, name="cc_peek",
                  description="Observe mailbox messages without marking them read; same cursor and "
                              "long-poll semantics as cc_inbox. Used by lifecycle notification hooks.")
+    mcp.add_tool(mailbox.directory, name="cc_directory",
+                 description="Find stable mailbox addresses by session/node/name and inspect current receiver leases.")
+    mcp.add_tool(mailbox.heartbeat, name="cc_heartbeat",
+                 description="Receiver-internal: renew the current CLI instance lease, not a message acknowledgement.")
+    mcp.add_tool(mailbox.receipt, name="cc_receipt",
+                 description="Report handed_off, acknowledged or completed for message IDs addressed to me. "
+                             "Handoff only means given to the client; acknowledge/complete only when actually true. "
+                             "Receipts do not send another message or wake a peer.")
+    mcp.add_tool(mailbox.delivery_status, name="cc_delivery_status",
+                 description="Inspect message stages, timestamps and handoff latency without consuming messages.")
     return mcp
 
 
@@ -119,6 +133,7 @@ def main():
                         "Localhost experiments only.")
     p.add_argument("--ray-address", default="auto")
     p.add_argument("--no-ray", action="store_true", help="skip Ray init (mailbox-only / testing)")
+    p.add_argument("--access-log", action="store_true", help="enable verbose HTTP request logs for debugging")
     p.add_argument("--allowed-hosts", default=None,
                    help="comma-list of Host:port to allow (keeps DNS-rebinding protection on). "
                         "Omit to disable the check and accept any Host (internal + token-gated).")
@@ -164,7 +179,9 @@ def main():
     )
     print(f"[cc-mcp] serving on http://{opt.host}:{opt.port}/mcp  (ray={'off' if opt.no_ray else CONFIG['ray_address']})",
           flush=True)
-    uvicorn.run(app, host=opt.host, port=opt.port)
+    mailbox.configure_logging()
+    logging.getLogger("mcp").setLevel(logging.WARNING)
+    uvicorn.run(app, host=opt.host, port=opt.port, access_log=opt.access_log, timeout_graceful_shutdown=5)
 
 
 if __name__ == "__main__":
